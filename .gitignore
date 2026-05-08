@@ -1,0 +1,43 @@
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Jupyter and local checkpoints
+.ipynb_checkpoints/
+
+# IDE and OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Generated outputs from preprocessing, analysis, and model training
+src/output/
+src/output_v1.zip
+
+# Optional: uncomment if raw or training datasets should stay local
+Data/raw/
+# Data/train/
