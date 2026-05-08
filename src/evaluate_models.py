@@ -1,0 +1,729 @@
+from __future__ import annotations
+
+from pathlib import Path
+import argparse
+import json
+import pickle
+import sys
+import warnings
+from typing import Any
+
+import joblib
+import numpy as np
+import pandas as pd
+from env_config import load_env, resolve_directory as env_resolve_directory
+
+warnings.filterwarnings("ignore")
+
+
+DEFAULT_FEATURES = ["CR", "ROS", "DS", "TAT", "SIZE", "is_HNX"]
+DEFAULT_TARGET_COL = "target"
+DEFAULT_PREPROCESSING_SUBDIR = Path("output") / "preprocessing"
+DEFAULT_MODELS_SUBDIR = Path("output") / "models"
+DEFAULT_OUTPUT_FILE = "model_evaluation.xlsx"
+DEFAULT_AUDIT_FILE = "dataset_split_audit.json"
+DEFAULT_PREPROCESSED_ENV_VAR = "PREPROCESSING_OUTPUT_DIR"
+DEFAULT_MODELS_ENV_VAR = "MODELS_OUTPUT_DIR"
+
+GRID_SEARCH_BETA = 2.0
+
+MODEL_DISPLAY_NAMES = {
+    "logistic_regression": "Logistic Regression",
+    "random_forest": "Random Forest",
+    "xgboost": "XGBoost",
+}
+MODEL_DATASETS = {
+    "logistic_regression": "scaled",
+    "random_forest": "raw",
+    "xgboost": "raw",
+}
+MODEL_FILE_NAMES = {
+    "logistic_regression": "logistic_regression_model.pkl",
+    "random_forest": "random_forest_model.pkl",
+    "xgboost": "xgboost_model.pkl",
+}
+MODEL_ALIASES = {
+    "lr": "logistic_regression",
+    "logistic": "logistic_regression",
+    "logistic_regression": "logistic_regression",
+    "rf": "random_forest",
+    "random_forest": "random_forest",
+    "randomforest": "random_forest",
+    "xgb": "xgboost",
+    "xgboost": "xgboost",
+    "all": "all",
+}
+
+
+def ensure_utf8_output() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+
+
+def require_sklearn() -> dict[str, Any]:
+    try:
+        from sklearn.metrics import (
+            accuracy_score,
+            confusion_matrix,
+            f1_score,
+            fbeta_score,
+            precision_score,
+            recall_score,
+            roc_auc_score,
+        )
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Thieu scikit-learn. Hay cai dependency roi chay lai, vi du: pip install scikit-learn"
+        ) from exc
+
+    return {
+        "accuracy_score": accuracy_score,
+        "confusion_matrix": confusion_matrix,
+        "f1_score": f1_score,
+        "fbeta_score": fbeta_score,
+        "precision_score": precision_score,
+        "recall_score": recall_score,
+        "roc_auc_score": roc_auc_score,
+    }
+
+
+def read_csv_required(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Khong tim thay file bat buoc: {path}")
+    return pd.read_csv(path)
+
+
+def read_csv_optional(path: Path) -> pd.DataFrame | None:
+    if not path.exists():
+        return None
+    return pd.read_csv(path)
+
+
+def dataframe_to_target(series_or_frame: pd.Series | pd.DataFrame, target_col: str) -> pd.Series:
+    if isinstance(series_or_frame, pd.DataFrame):
+        if target_col in series_or_frame.columns:
+            series = series_or_frame[target_col]
+        else:
+            series = series_or_frame.iloc[:, 0]
+    else:
+        series = series_or_frame
+
+    clean = pd.to_numeric(series, errors="coerce")
+    if clean.isna().any():
+        raise ValueError("Cot target co gia tri khong hop le.")
+    return clean.astype(int).rename(target_col)
+
+
+def validate_feature_frame(df: pd.DataFrame, features: list[str], file_name: str) -> pd.DataFrame:
+    missing = [col for col in features if col not in df.columns]
+    if missing:
+        raise ValueError(f"File {file_name} thieu feature bat buoc: {missing}")
+    return df[features].copy()
+
+
+def resolve_preprocessed_dir(user_input: str | None) -> Path:
+    path = env_resolve_directory(
+        user_input,
+        DEFAULT_PREPROCESSED_ENV_VAR,
+        Path("src") / DEFAULT_PREPROCESSING_SUBDIR,
+    )
+    if path.exists() and path.is_dir():
+        return path.resolve()
+    raise FileNotFoundError(f"Khong tim thay thu muc preprocessing theo --preprocessed-dir: {path}")
+
+
+def resolve_models_dir(user_input: str | None) -> Path:
+    path = env_resolve_directory(
+        user_input,
+        DEFAULT_MODELS_ENV_VAR,
+        Path("src") / DEFAULT_MODELS_SUBDIR,
+    )
+    if path.exists() and path.is_dir():
+        return path.resolve()
+    raise FileNotFoundError(f"Khong tim thay thu muc models theo --models-dir: {path}")
+
+
+def normalize_requested_models(models: list[str] | tuple[str, ...] | None) -> list[str]:
+    if not models:
+        return list(MODEL_DISPLAY_NAMES.keys())
+
+    normalized: list[str] = []
+    for model in models:
+        key = model.strip().lower()
+        if key not in MODEL_ALIASES:
+            valid = ", ".join(sorted(MODEL_ALIASES))
+            raise ValueError(f"Model '{model}' khong hop le. Gia tri hop le: {valid}")
+
+        canonical = MODEL_ALIASES[key]
+        if canonical == "all":
+            return list(MODEL_DISPLAY_NAMES.keys())
+        if canonical not in normalized:
+            normalized.append(canonical)
+
+    return normalized
+
+
+def load_preprocessed_bundle(preprocessed_dir: Path) -> dict[str, Any]:
+    config_path = preprocessed_dir / "preprocessing_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+
+    # Neu config khong co, suy ra feature tu file X_train
+    X_train_raw_full = read_csv_required(preprocessed_dir / "X_train.csv")
+    inferred_features = list(X_train_raw_full.columns)
+    features = config.get("features", inferred_features if inferred_features else DEFAULT_FEATURES)
+    target_col = config.get("target_col", DEFAULT_TARGET_COL)
+
+    X_train_raw = validate_feature_frame(X_train_raw_full, features, "X_train.csv")
+    X_test_raw = validate_feature_frame(read_csv_required(preprocessed_dir / "X_test.csv"), features, "X_test.csv")
+    X_train_scaled = validate_feature_frame(read_csv_required(preprocessed_dir / "X_train_scaled.csv"), features, "X_train_scaled.csv")
+    X_test_scaled = validate_feature_frame(read_csv_required(preprocessed_dir / "X_test_scaled.csv"), features, "X_test_scaled.csv")
+    y_train = dataframe_to_target(read_csv_required(preprocessed_dir / "y_train.csv"), target_col)
+    y_test = dataframe_to_target(read_csv_required(preprocessed_dir / "y_test.csv"), target_col)
+    meta_train = read_csv_optional(preprocessed_dir / "meta_train.csv")
+    meta_test = read_csv_optional(preprocessed_dir / "meta_test.csv")
+
+    if len(X_train_raw) != len(X_train_scaled) or len(X_train_raw) != len(y_train):
+        raise ValueError("So dong train giua X_train/X_train_scaled/y_train khong khop.")
+    if len(X_test_raw) != len(X_test_scaled) or len(X_test_raw) != len(y_test):
+        raise ValueError("So dong test giua X_test/X_test_scaled/y_test khong khop.")
+    if meta_train is not None and len(meta_train) != len(X_train_raw):
+        raise ValueError("So dong meta_train khong khop voi X_train.")
+    if meta_test is not None and len(meta_test) != len(X_test_raw):
+        raise ValueError("So dong meta_test khong khop voi X_test.")
+
+    return {
+        "preprocessed_dir": preprocessed_dir,
+        "config": config,
+        "features": features,
+        "target_col": target_col,
+        "X_train_raw": X_train_raw,
+        "X_test_raw": X_test_raw,
+        "X_train_scaled": X_train_scaled,
+        "X_test_scaled": X_test_scaled,
+        "y_train": y_train,
+        "y_test": y_test,
+        "meta_train": meta_train,
+        "meta_test": meta_test,
+    }
+
+
+def get_dataset_pair(bundle: dict[str, Any], dataset_kind: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if dataset_kind == "scaled":
+        return bundle["X_train_scaled"], bundle["X_test_scaled"]
+    return bundle["X_train_raw"], bundle["X_test_raw"]
+
+
+def safe_predict_scores(model: Any, X: pd.DataFrame) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        return np.asarray(model.predict_proba(X)[:, 1], dtype=float)
+    if hasattr(model, "decision_function"):
+        scores = np.asarray(model.decision_function(X), dtype=float)
+        score_min, score_max = float(scores.min()), float(scores.max())
+        if score_max > score_min:
+            return (scores - score_min) / (score_max - score_min)
+        return np.zeros_like(scores, dtype=float)
+    return np.asarray(model.predict(X), dtype=float)
+
+
+def evaluate_predictions(
+    y_true: pd.Series,
+    scores: np.ndarray,
+    threshold: float,
+) -> tuple[dict[str, float], np.ndarray]:
+    sklearn_api = require_sklearn()
+    y_pred = (scores >= threshold).astype(int)
+
+    try:
+        auc = sklearn_api["roc_auc_score"](y_true, scores)
+    except ValueError:
+        auc = float("nan")
+
+    tn, fp, fn, tp = sklearn_api["confusion_matrix"](y_true, y_pred, labels=[0, 1]).ravel()
+
+    metrics = {
+        "accuracy": float(sklearn_api["accuracy_score"](y_true, y_pred)),
+        "auc": float(auc),
+        "f1": float(sklearn_api["f1_score"](y_true, y_pred, zero_division=0)),
+        "f2": float(sklearn_api["fbeta_score"](y_true, y_pred, beta=GRID_SEARCH_BETA, zero_division=0)),
+        "precision": float(sklearn_api["precision_score"](y_true, y_pred, zero_division=0)),
+        "recall": float(sklearn_api["recall_score"](y_true, y_pred, zero_division=0)),
+        "specificity": float(tn / (tn + fp)) if (tn + fp) > 0 else float("nan"),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+    }
+    return metrics, y_pred
+
+
+def print_metrics(model_name: str, dataset_kind: str, threshold: float, metrics: dict[str, float]) -> None:
+    print("\n" + "=" * 60)
+    print(f"{model_name} | input_data={dataset_kind} | threshold={threshold:.2f}")
+    print("=" * 60)
+    print(f"Accuracy   : {metrics['accuracy']:.4f}")
+    print(f"AUC-ROC    : {metrics['auc']:.4f}")
+    print(f"F1-score   : {metrics['f1']:.4f}")
+    print(f"F2-score   : {metrics['f2']:.4f}")
+    print(f"Precision  : {metrics['precision']:.4f}")
+    print(f"Recall     : {metrics['recall']:.4f}")
+    print(f"Specificity: {metrics['specificity']:.4f}")
+    print(f"Confusion  : TN={metrics['tn']} FP={metrics['fp']} FN={metrics['fn']} TP={metrics['tp']}")
+
+
+def try_load_with_joblib_then_pickle(model_path: Path) -> Any:
+    try:
+        return joblib.load(model_path)
+    except Exception:
+        with model_path.open("rb") as fh:
+            return pickle.load(fh)
+
+
+def load_model_artifact(model_path: Path, model_key: str) -> dict[str, Any]:
+    if not model_path.exists():
+        raise FileNotFoundError(f"Khong tim thay model file: {model_path}")
+
+    obj = try_load_with_joblib_then_pickle(model_path)
+
+    if isinstance(obj, dict) and "model" in obj:
+        artifact = obj.copy()
+        artifact.setdefault("threshold", 0.50)
+        artifact.setdefault("features", DEFAULT_FEATURES)
+        artifact.setdefault("input_data", MODEL_DATASETS.get(model_key, "raw"))
+        artifact["loader"] = "joblib_or_pickle"
+        return artifact
+
+    return {
+        "model": obj,
+        "threshold": 0.50,
+        "features": DEFAULT_FEATURES,
+        "input_data": MODEL_DATASETS.get(model_key, "raw"),
+        "loader": "joblib_or_pickle",
+    }
+
+
+def save_prediction_table(
+    model_key: str,
+    meta_test: pd.DataFrame | None,
+    y_test: pd.Series,
+    y_pred: np.ndarray,
+    scores: np.ndarray,
+    threshold: float,
+    output_dir: Path,
+) -> Path:
+    result_df = pd.DataFrame(
+        {
+            "actual_target": y_test.reset_index(drop=True),
+            "predicted_target": pd.Series(y_pred).reset_index(drop=True),
+            "score_positive_class": pd.Series(scores).reset_index(drop=True),
+            "threshold_used": threshold,
+        }
+    )
+    if meta_test is not None:
+        result_df = pd.concat([meta_test.reset_index(drop=True), result_df], axis=1)
+
+    output_path = output_dir / f"evaluation_predictions_{model_key}.csv"
+    result_df.to_csv(output_path, index=False)
+    return output_path
+
+
+def find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    lowered = {col.lower(): col for col in df.columns}
+    for name in candidates:
+        if name.lower() in lowered:
+            return lowered[name.lower()]
+    return None
+
+
+def infer_split_semantics(config: dict[str, Any]) -> dict[str, Any]:
+    split_method = config.get("split_method", "unknown")
+    return {
+        "split_method": split_method,
+        "train_cutoff_year": config.get("train_cutoff_year"),
+        "test_year": config.get("test_year"),
+        "exclude_finance": config.get("exclude_finance"),
+    }
+
+
+def audit_split(bundle: dict[str, Any]) -> dict[str, Any]:
+    meta_train = bundle.get("meta_train")
+    meta_test = bundle.get("meta_test")
+    config = bundle.get("config", {})
+
+    audit: dict[str, Any] = {
+        "available": meta_train is not None and meta_test is not None,
+        "notes": [],
+        "split_info": infer_split_semantics(config),
+    }
+
+    if meta_train is None or meta_test is None:
+        audit["notes"].append("Khong co meta_train/meta_test, bo qua split audit.")
+        return audit
+
+    firm_col = find_column(meta_train, ["Ma", "ma", "ticker", "symbol", "firm_id", "company_id", "code"])
+    year_col = find_column(meta_train, ["nam", "year", "fiscal_year"])
+    finance_col = find_column(meta_train, ["is_finance", "finance_flag"])
+
+    audit["firm_column"] = firm_col
+    audit["year_column"] = year_col
+    audit["finance_column"] = finance_col
+    audit["train_rows"] = int(len(meta_train))
+    audit["test_rows"] = int(len(meta_test))
+
+    if year_col is not None:
+        audit["train_year_distribution"] = {
+            str(k): int(v) for k, v in meta_train[year_col].value_counts().sort_index().to_dict().items()
+        }
+        audit["test_year_distribution"] = {
+            str(k): int(v) for k, v in meta_test[year_col].value_counts().sort_index().to_dict().items()
+        }
+
+    if firm_col is None or year_col is None:
+        audit["notes"].append("Khong xac dinh duoc cot cong ty/nam de audit chi tiet.")
+        return audit
+
+    train_firms = meta_train[firm_col].astype(str)
+    test_firms = meta_test[firm_col].astype(str)
+    train_years = pd.to_numeric(meta_train[year_col], errors="coerce")
+    test_years = pd.to_numeric(meta_test[year_col], errors="coerce")
+
+    train_unique_firms = set(train_firms.dropna().unique().tolist())
+    test_unique_firms = set(test_firms.dropna().unique().tolist())
+    overlap_firms = train_unique_firms & test_unique_firms
+
+    train_keys = set(
+        zip(
+            meta_train[firm_col].astype(str),
+            pd.to_numeric(meta_train[year_col], errors="coerce").fillna(-1).astype(int),
+        )
+    )
+    test_keys = set(
+        zip(
+            meta_test[firm_col].astype(str),
+            pd.to_numeric(meta_test[year_col], errors="coerce").fillna(-1).astype(int),
+        )
+    )
+    exact_key_overlap = train_keys & test_keys
+
+    firm_to_train_years = (
+        pd.DataFrame({firm_col: train_firms, year_col: train_years})
+        .dropna()
+        .groupby(firm_col)[year_col]
+        .apply(lambda s: sorted(set(int(v) for v in s.tolist())))
+        .to_dict()
+    )
+
+    same_company_in_train = 0
+    past_year_in_train = 0
+    future_year_in_train = 0
+    both_past_and_future_in_train = 0
+
+    for firm, year in zip(test_firms.tolist(), test_years.tolist()):
+        if pd.isna(firm) or pd.isna(year):
+            continue
+        year_int = int(year)
+        seen_years = firm_to_train_years.get(str(firm), [])
+        if not seen_years:
+            continue
+
+        same_company_in_train += 1
+        has_past_year = any(train_year < year_int for train_year in seen_years)
+        has_future_year = any(train_year > year_int for train_year in seen_years)
+
+        if has_past_year:
+            past_year_in_train += 1
+        if has_future_year:
+            future_year_in_train += 1
+        if has_past_year and has_future_year:
+            both_past_and_future_in_train += 1
+
+    audit["unique_firms"] = {
+        "train": int(len(train_unique_firms)),
+        "test": int(len(test_unique_firms)),
+        "overlap": int(len(overlap_firms)),
+    }
+    audit["time_based_panel_check"] = {
+        "same_company_in_both_sets": int(same_company_in_train),
+        "past_year_in_train_for_test_rows": int(past_year_in_train),
+        "future_year_in_train_for_test_rows": int(future_year_in_train),
+        "both_past_and_future_in_train_for_test_rows": int(both_past_and_future_in_train),
+        "fully_unseen_company_rows": int(len(meta_test) - same_company_in_train),
+        "exact_same_ma_year_overlap": int(len(exact_key_overlap)),
+    }
+
+    split_method = audit["split_info"].get("split_method")
+    if split_method == "time_based":
+        if len(exact_key_overlap) == 0:
+            audit["notes"].append(
+                "Time-based split: cung cong ty xuat hien o train/test la binh thuong voi panel data; "
+                "khong co overlap chinh xac theo (Ma, nam)."
+            )
+        else:
+            audit["notes"].append(
+                "CANH BAO: phat hien overlap chinh xac theo (Ma, nam) giua train va test."
+            )
+    else:
+        if len(overlap_firms) > 0:
+            audit["notes"].append(
+                "Co overlap cong ty giua train va test. Neu day la random split panel data thi can xem xet leakage."
+            )
+
+    if finance_col is not None:
+        train_finance_mask = meta_train[finance_col].fillna(False).astype(bool)
+        test_finance_mask = meta_test[finance_col].fillna(False).astype(bool)
+
+        train_finance_firms = set(meta_train.loc[train_finance_mask, firm_col].astype(str).unique().tolist())
+        test_finance_firms = set(meta_test.loc[test_finance_mask, firm_col].astype(str).unique().tolist())
+
+        audit["finance_rows"] = {
+            "train": int(train_finance_mask.sum()),
+            "test": int(test_finance_mask.sum()),
+            "total": int(train_finance_mask.sum() + test_finance_mask.sum()),
+        }
+        audit["finance_unique_firms"] = {
+            "train": int(len(train_finance_firms)),
+            "test": int(len(test_finance_firms)),
+            "union": int(len(train_finance_firms | test_finance_firms)),
+            "overlap": int(len(train_finance_firms & test_finance_firms)),
+        }
+
+    return audit
+
+
+def print_audit_summary(audit: dict[str, Any]) -> None:
+    print("\n" + "=" * 60)
+    print("DATA SPLIT AUDIT")
+    print("=" * 60)
+
+    if not audit.get("available", False):
+        print("Khong co du meta_train/meta_test de audit.")
+        return
+
+    split_info = audit.get("split_info", {})
+    if split_info:
+        print(
+            "Split info   : "
+            f"method={split_info.get('split_method')} | "
+            f"train_cutoff={split_info.get('train_cutoff_year')} | "
+            f"test_year={split_info.get('test_year')} | "
+            f"exclude_finance={split_info.get('exclude_finance')}"
+        )
+
+    print(f"Train rows    : {audit.get('train_rows')}")
+    print(f"Test rows     : {audit.get('test_rows')}")
+
+    unique_firms = audit.get("unique_firms", {})
+    if unique_firms:
+        print(
+            "Unique firms  : "
+            f"train={unique_firms.get('train')} | "
+            f"test={unique_firms.get('test')} | "
+            f"overlap={unique_firms.get('overlap')}"
+        )
+
+    year_train = audit.get("train_year_distribution")
+    year_test = audit.get("test_year_distribution")
+    if year_train is not None:
+        print(f"Train years   : {year_train}")
+    if year_test is not None:
+        print(f"Test years    : {year_test}")
+
+    panel_check = audit.get("time_based_panel_check", {})
+    if panel_check:
+        print(
+            "Panel overlap : "
+            f"same_company={panel_check.get('same_company_in_both_sets')} | "
+            f"past_year={panel_check.get('past_year_in_train_for_test_rows')} | "
+            f"future_year={panel_check.get('future_year_in_train_for_test_rows')} | "
+            f"both={panel_check.get('both_past_and_future_in_train_for_test_rows')} | "
+            f"unseen={panel_check.get('fully_unseen_company_rows')} | "
+            f"same_(Ma,nam)={panel_check.get('exact_same_ma_year_overlap')}"
+        )
+
+    finance_rows = audit.get("finance_rows")
+    finance_firms = audit.get("finance_unique_firms")
+    if finance_rows is not None:
+        print(
+            "Finance rows  : "
+            f"train={finance_rows.get('train')} | "
+            f"test={finance_rows.get('test')} | "
+            f"total={finance_rows.get('total')}"
+        )
+    if finance_firms is not None:
+        print(
+            "Finance firms : "
+            f"train={finance_firms.get('train')} | "
+            f"test={finance_firms.get('test')} | "
+            f"union={finance_firms.get('union')} | "
+            f"overlap={finance_firms.get('overlap')}"
+        )
+
+    notes = audit.get("notes", [])
+    if notes:
+        print("Notes        :")
+        for note in notes:
+            print(f"  - {note}")
+
+
+def evaluate_saved_models(
+    preprocessed_dir: str | Path | None = None,
+    models_dir: str | Path | None = None,
+    models: list[str] | tuple[str, ...] | None = None,
+    output_dir: str | Path | None = None,
+    run_audit: bool = True,
+) -> tuple[pd.DataFrame, dict[str, Any] | None]:
+    requested_models = normalize_requested_models(models)
+    bundle = load_preprocessed_bundle(resolve_preprocessed_dir(str(preprocessed_dir) if preprocessed_dir is not None else None))
+    resolved_models_dir = resolve_models_dir(str(models_dir) if models_dir is not None else None)
+
+    if output_dir is None:
+        final_output_dir = resolved_models_dir
+    else:
+        final_output_dir = Path(output_dir).expanduser().resolve()
+        final_output_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list[dict[str, Any]] = []
+
+    for model_key in requested_models:
+        try:
+            model_path = resolved_models_dir / MODEL_FILE_NAMES[model_key]
+            artifact = load_model_artifact(model_path, model_key)
+            model = artifact["model"]
+            threshold = float(artifact.get("threshold", 0.50))
+            dataset_kind = str(artifact.get("input_data", MODEL_DATASETS[model_key]))
+            artifact_features = list(artifact.get("features", bundle["features"]))
+
+            available_bundle_features = set(bundle["features"])
+            missing = [feat for feat in artifact_features if feat not in available_bundle_features]
+            if missing:
+                raise ValueError(f"Feature mismatch. Cac feature thieu trong preprocessing bundle: {missing}")
+
+            _, X_test = get_dataset_pair(bundle, dataset_kind)
+            X_test_eval = X_test[artifact_features].copy()
+            y_test = bundle["y_test"]
+
+            scores = safe_predict_scores(model, X_test_eval)
+            metrics, y_pred = evaluate_predictions(y_test, scores, threshold=threshold)
+            prediction_path = save_prediction_table(
+                model_key=model_key,
+                meta_test=bundle["meta_test"],
+                y_test=y_test,
+                y_pred=y_pred,
+                scores=scores,
+                threshold=threshold,
+                output_dir=final_output_dir,
+            )
+
+            print_metrics(MODEL_DISPLAY_NAMES[model_key], dataset_kind, threshold, metrics)
+
+            result = {
+                "model": MODEL_DISPLAY_NAMES[model_key],
+                "input_data": dataset_kind,
+                "threshold": threshold,
+                "artifact_loader": artifact.get("loader", "unknown"),
+                "model_path": str(model_path),
+                "prediction_path": str(prediction_path),
+                **metrics,
+            }
+            results.append(result)
+        except Exception as exc:
+            print(f"\n[ERROR] {MODEL_DISPLAY_NAMES[model_key]} failed: {exc}")
+
+    if not results:
+        raise RuntimeError("Khong model nao evaluate duoc. Hay kiem tra model file va preprocessing output.")
+
+    comparison_df = pd.DataFrame(results)[
+        [
+            "model",
+            "input_data",
+            "threshold",
+            "accuracy",
+            "auc",
+            "f1",
+            "f2",
+            "precision",
+            "recall",
+            "specificity",
+            "tn",
+            "fp",
+            "fn",
+            "tp",
+            "artifact_loader",
+            "model_path",
+            "prediction_path",
+        ]
+    ].sort_values(["f2", "recall", "auc"], ascending=[False, False, False], na_position="last")
+
+    eval_path = final_output_dir / DEFAULT_OUTPUT_FILE
+    comparison_df.to_excel(eval_path, index=False)
+    comparison_df.to_csv(eval_path.with_suffix(".csv"), index=False)
+
+    audit_result = audit_split(bundle) if run_audit else None
+    if audit_result is not None:
+        audit_path = final_output_dir / DEFAULT_AUDIT_FILE
+        audit_path.write_text(json.dumps(audit_result, indent=2, ensure_ascii=False), encoding="utf-8")
+        print_audit_summary(audit_result)
+        print(f"\nSaved split audit to: {audit_path}")
+
+    print("\n" + "=" * 60)
+    print("MODEL EVALUATION SUMMARY")
+    print("=" * 60)
+    print(comparison_df.to_string(index=False))
+    print(f"\nSaved evaluation table to: {eval_path}")
+    print(f"Saved evaluation table to: {eval_path.with_suffix('.csv')}")
+
+    return comparison_df, audit_result
+
+
+def main() -> None:
+    ensure_utf8_output()
+    load_env()
+
+    parser = argparse.ArgumentParser(description="Evaluate saved models on preprocessing outputs.")
+    parser.add_argument(
+        "--preprocessed-dir",
+        type=str,
+        default=None,
+        help="Thu muc chua output preprocessing.",
+    )
+    parser.add_argument(
+        "--models-dir",
+        type=str,
+        default=None,
+        help="Thu muc chua model da train.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Thu muc luu bang evaluation va file audit. Mac dinh = models_dir",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="*",
+        default=None,
+        help="Danh sach model can evaluate. Gia tri hop le: lr rf xgb logistic_regression random_forest xgboost all",
+    )
+    parser.add_argument(
+        "--skip-audit",
+        action="store_true",
+        help="Bo qua split audit train/test.",
+    )
+    args = parser.parse_args()
+
+    try:
+        evaluate_saved_models(
+            preprocessed_dir=args.preprocessed_dir,
+            models_dir=args.models_dir,
+            output_dir=args.output_dir,
+            models=args.models,
+            run_audit=not args.skip_audit,
+        )
+    except Exception as exc:
+        print(f"\n[FATAL] {exc}")
+        raise SystemExit(1) from exc
+
+
+if __name__ == "__main__":
+    main()
