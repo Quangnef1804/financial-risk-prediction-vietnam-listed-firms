@@ -56,6 +56,16 @@ MODEL_ALIASES = {
     "all": "all",
 }
 
+CHART_METRICS = [
+    ("accuracy", "Accuracy"),
+    ("auc", "AUC"),
+    ("f1", "F1"),
+    ("f2", "F2"),
+    ("recall", "Recall"),
+    ("precision", "Precision"),
+]
+CHART_COLORS = ["#4C78A8", "#F58518", "#54A24B"]
+
 
 # ============================================================
 # Utilities
@@ -714,6 +724,68 @@ def save_training_summary(bundle, requested_models, results_df, output_dir) -> N
     )
 
 
+def save_model_performance_chart(results_df: pd.DataFrame, output_dir: Path) -> Path | None:
+    required_columns = {"model", *(metric_key for metric_key, _ in CHART_METRICS)}
+    missing_columns = sorted(required_columns - set(results_df.columns))
+    if missing_columns:
+        print(f"[WARN] Khong the ve Model Performance Comparison Chart. Thieu cot: {missing_columns}")
+        return None
+
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        print("[WARN] Khong the ve Model Performance Comparison Chart vi thieu matplotlib.")
+        return None
+
+    chart_df = results_df[["model", *(metric_key for metric_key, _ in CHART_METRICS)]].copy()
+    chart_df = chart_df.set_index("model")
+
+    model_names = chart_df.index.tolist()
+    metric_labels = [metric_label for _, metric_label in CHART_METRICS]
+    x = np.arange(len(metric_labels))
+    bar_width = 0.22 if len(model_names) >= 3 else 0.8 / max(len(model_names), 1)
+
+    fig, ax = plt.subplots(figsize=(12, 6.5))
+    for idx, model_name in enumerate(model_names):
+        offset = (idx - (len(model_names) - 1) / 2) * bar_width
+        metric_values = [float(chart_df.loc[model_name, metric_key]) for metric_key, _ in CHART_METRICS]
+        bars = ax.bar(
+            x + offset,
+            metric_values,
+            width=bar_width,
+            label=model_name,
+            color=CHART_COLORS[idx % len(CHART_COLORS)],
+            edgecolor="white",
+            linewidth=0.8,
+        )
+        for bar, value in zip(bars, metric_values):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                value + 0.01,
+                f"{value:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+
+    ax.set_title("Model Performance Comparison Chart", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Evaluation Metrics")
+    ax.set_ylabel("Metric Value")
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_labels)
+    ax.set_ylim(0, 1.08)
+    ax.grid(axis="y", linestyle="--", alpha=0.25)
+    ax.legend(title="Models")
+    fig.tight_layout()
+
+    chart_path = output_dir / "model_performance_comparison_chart.png"
+    fig.savefig(chart_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved model performance chart: {chart_path}")
+    return chart_path
+
+
 # ============================================================
 # Public API
 # ============================================================
@@ -771,6 +843,7 @@ def train_and_evaluate_models(
     comparison_df.to_csv(final_output / "model_comparison.csv",  index=False)
     comparison_df.to_excel(final_output / "model_comparison.xlsx", index=False)
     save_training_summary(bundle, requested_models, comparison_df, final_output)
+    save_model_performance_chart(comparison_df, final_output)
 
     print(f"\nOutput luu tai: {final_output}")
     return comparison_df

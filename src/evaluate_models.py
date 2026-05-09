@@ -53,6 +53,17 @@ MODEL_ALIASES = {
     "xgboost": "xgboost",
     "all": "all",
 }
+COMPARISON_METRICS = [
+    ("auc", "AUC"),
+    ("f1", "F1"),
+    ("f2", "F2"),
+    ("precision", "Precision"),
+    ("recall", "Recall"),
+    ("specificity", "Specificity"),
+    ("accuracy", "Accuracy"),
+]
+PLOT_COLORS = ["#4C78A8", "#F58518", "#54A24B"]
+THRESHOLD_CURVE_GRID = np.round(np.arange(0.0, 1.001, 0.01), 2)
 
 
 def ensure_utf8_output() -> None:
@@ -64,13 +75,16 @@ def ensure_utf8_output() -> None:
 
 def require_sklearn() -> dict[str, Any]:
     try:
+        from sklearn.calibration import calibration_curve
         from sklearn.metrics import (
             accuracy_score,
             confusion_matrix,
             f1_score,
             fbeta_score,
+            precision_recall_curve,
             precision_score,
             recall_score,
+            roc_curve,
             roc_auc_score,
         )
     except ModuleNotFoundError as exc:
@@ -79,14 +93,27 @@ def require_sklearn() -> dict[str, Any]:
         ) from exc
 
     return {
+        "calibration_curve": calibration_curve,
         "accuracy_score": accuracy_score,
         "confusion_matrix": confusion_matrix,
         "f1_score": f1_score,
         "fbeta_score": fbeta_score,
+        "precision_recall_curve": precision_recall_curve,
         "precision_score": precision_score,
         "recall_score": recall_score,
+        "roc_curve": roc_curve,
         "roc_auc_score": roc_auc_score,
     }
+
+
+def require_matplotlib():
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Thieu matplotlib. Hay cai dependency roi chay lai, vi du: pip install matplotlib"
+        ) from exc
+    return plt
 
 
 def read_csv_required(path: Path) -> pd.DataFrame:
@@ -566,6 +593,328 @@ def print_audit_summary(audit: dict[str, Any]) -> None:
             print(f"  - {note}")
 
 
+def slugify_model_name(model_name: str) -> str:
+    return model_name.strip().lower().replace(" ", "_")
+
+
+def make_plots_dir(output_dir: Path) -> Path:
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    return plots_dir
+
+
+def compute_threshold_metrics(y_true: pd.Series, scores: np.ndarray) -> pd.DataFrame:
+    sklearn_api = require_sklearn()
+    rows: list[dict[str, float]] = []
+
+    for threshold in THRESHOLD_CURVE_GRID:
+        y_pred = (scores >= threshold).astype(int)
+        tn, fp, fn, tp = sklearn_api["confusion_matrix"](y_true, y_pred, labels=[0, 1]).ravel()
+        rows.append(
+            {
+                "threshold": float(threshold),
+                "accuracy": float(sklearn_api["accuracy_score"](y_true, y_pred)),
+                "precision": float(sklearn_api["precision_score"](y_true, y_pred, zero_division=0)),
+                "recall": float(sklearn_api["recall_score"](y_true, y_pred, zero_division=0)),
+                "f2": float(sklearn_api["fbeta_score"](y_true, y_pred, beta=GRID_SEARCH_BETA, zero_division=0)),
+                "specificity": float(tn / (tn + fp)) if (tn + fp) > 0 else float("nan"),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def save_metric_bar_comparison(comparison_df: pd.DataFrame, output_dir: Path) -> Path:
+    plt = require_matplotlib()
+
+    chart_df = comparison_df[["model", *(metric_key for metric_key, _ in COMPARISON_METRICS)]].copy()
+    chart_df = chart_df.set_index("model")
+    model_names = chart_df.index.tolist()
+    metric_labels = [metric_label for _, metric_label in COMPARISON_METRICS]
+    x = np.arange(len(metric_labels))
+    bar_width = 0.22 if len(model_names) >= 3 else 0.8 / max(len(model_names), 1)
+
+    fig, ax = plt.subplots(figsize=(13, 6.5))
+    for idx, model_name in enumerate(model_names):
+        offset = (idx - (len(model_names) - 1) / 2) * bar_width
+        values = [float(chart_df.loc[model_name, metric_key]) for metric_key, _ in COMPARISON_METRICS]
+        bars = ax.bar(
+            x + offset,
+            values,
+            width=bar_width,
+            label=model_name,
+            color=PLOT_COLORS[idx % len(PLOT_COLORS)],
+            edgecolor="white",
+            linewidth=0.8,
+        )
+        for bar, value in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, value + 0.01, f"{value:.2f}", ha="center", va="bottom", fontsize=8)
+
+    ax.set_title("Metric Bar Comparison", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Evaluation Metrics")
+    ax.set_ylabel("Metric Value")
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_labels)
+    ax.set_ylim(0, 1.08)
+    ax.grid(axis="y", linestyle="--", alpha=0.25)
+    ax.legend(title="Models")
+    fig.tight_layout()
+
+    output_path = output_dir / "metric_bar_comparison.png"
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def save_roc_curve_comparison(model_payloads: list[dict[str, Any]], output_dir: Path) -> Path | None:
+    plt = require_matplotlib()
+    sklearn_api = require_sklearn()
+
+    if len(pd.Series(model_payloads[0]["y_true"]).unique()) < 2:
+        print("[WARN] Bo qua ROC curve comparison vi y_test chi co 1 class.")
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 6.5))
+    for idx, payload in enumerate(model_payloads):
+        fpr, tpr, _ = sklearn_api["roc_curve"](payload["y_true"], payload["scores"])
+        ax.plot(
+            fpr,
+            tpr,
+            label=f"{payload['model']} (AUC={payload['metrics']['auc']:.3f})",
+            color=PLOT_COLORS[idx % len(PLOT_COLORS)],
+            linewidth=2,
+        )
+
+    ax.plot([0, 1], [0, 1], linestyle="--", color="#666666", linewidth=1)
+    ax.set_title("ROC Curve Comparison", fontsize=14, fontweight="bold")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.grid(True, linestyle="--", alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+
+    output_path = output_dir / "roc_curve_comparison.png"
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def save_precision_recall_curve_comparison(model_payloads: list[dict[str, Any]], output_dir: Path) -> Path | None:
+    plt = require_matplotlib()
+    sklearn_api = require_sklearn()
+
+    if len(pd.Series(model_payloads[0]["y_true"]).unique()) < 2:
+        print("[WARN] Bo qua Precision-Recall curve comparison vi y_test chi co 1 class.")
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 6.5))
+    for idx, payload in enumerate(model_payloads):
+        precision, recall, _ = sklearn_api["precision_recall_curve"](payload["y_true"], payload["scores"])
+        ax.plot(
+            recall,
+            precision,
+            label=f"{payload['model']} (F2={payload['metrics']['f2']:.3f})",
+            color=PLOT_COLORS[idx % len(PLOT_COLORS)],
+            linewidth=2,
+        )
+
+    ax.set_title("Precision-Recall Curve Comparison", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, linestyle="--", alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+
+    output_path = output_dir / "precision_recall_curve_comparison.png"
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def save_calibration_curve_comparison(model_payloads: list[dict[str, Any]], output_dir: Path) -> Path | None:
+    plt = require_matplotlib()
+    sklearn_api = require_sklearn()
+
+    if len(pd.Series(model_payloads[0]["y_true"]).unique()) < 2:
+        print("[WARN] Bo qua Calibration curve comparison vi y_test chi co 1 class.")
+        return None
+
+    fig, ax = plt.subplots(figsize=(8, 6.5))
+    for idx, payload in enumerate(model_payloads):
+        frac_pos, mean_pred = sklearn_api["calibration_curve"](
+            payload["y_true"],
+            payload["scores"],
+            n_bins=10,
+            strategy="uniform",
+        )
+        ax.plot(
+            mean_pred,
+            frac_pos,
+            marker="o",
+            label=payload["model"],
+            color=PLOT_COLORS[idx % len(PLOT_COLORS)],
+            linewidth=2,
+        )
+
+    ax.plot([0, 1], [0, 1], linestyle="--", color="#666666", linewidth=1, label="Perfect calibration")
+    ax.set_title("Calibration Curve Comparison", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Mean Predicted Probability")
+    ax.set_ylabel("Fraction of Positives")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.grid(True, linestyle="--", alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+
+    output_path = output_dir / "calibration_curve_comparison.png"
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def save_confusion_matrix_plot(payload: dict[str, Any], output_dir: Path) -> Path:
+    plt = require_matplotlib()
+
+    matrix = np.array(
+        [
+            [payload["metrics"]["tn"], payload["metrics"]["fp"]],
+            [payload["metrics"]["fn"], payload["metrics"]["tp"]],
+        ]
+    )
+
+    fig, ax = plt.subplots(figsize=(6, 5.5))
+    im = ax.imshow(matrix, cmap="Blues")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    for row_idx in range(2):
+        for col_idx in range(2):
+            ax.text(col_idx, row_idx, f"{matrix[row_idx, col_idx]}", ha="center", va="center", color="#111111", fontsize=12)
+
+    ax.set_title(f"Confusion Matrix - {payload['model']}", fontsize=13, fontweight="bold")
+    ax.set_xticks([0, 1], labels=["Pred 0", "Pred 1"])
+    ax.set_yticks([0, 1], labels=["True 0", "True 1"])
+    fig.tight_layout()
+
+    output_path = output_dir / "confusion_matrix.png"
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def save_threshold_curves(payload: dict[str, Any], output_dir: Path) -> list[Path]:
+    plt = require_matplotlib()
+    threshold_df = compute_threshold_metrics(payload["y_true"], payload["scores"])
+    threshold_df.to_csv(output_dir / "threshold_metrics.csv", index=False)
+
+    saved_paths: list[Path] = []
+
+    fig, ax = plt.subplots(figsize=(9.5, 6))
+    ax.plot(threshold_df["threshold"], threshold_df["precision"], label="Precision", linewidth=2, color="#F58518")
+    ax.plot(threshold_df["threshold"], threshold_df["recall"], label="Recall", linewidth=2, color="#54A24B")
+    ax.plot(threshold_df["threshold"], threshold_df["f2"], label="F2", linewidth=2, color="#4C78A8")
+    ax.plot(threshold_df["threshold"], threshold_df["accuracy"], label="Accuracy", linewidth=2, color="#E45756")
+    ax.plot(threshold_df["threshold"], threshold_df["specificity"], label="Specificity", linewidth=2, color="#72B7B2")
+    ax.axvline(payload["threshold"], linestyle="--", color="#333333", linewidth=1.2, label=f"Chosen threshold={payload['threshold']:.2f}")
+    ax.set_title(f"Threshold Curve - {payload['model']}", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Threshold")
+    ax.set_ylabel("Metric Value")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, linestyle="--", alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    threshold_curve_path = output_dir / "threshold_curve.png"
+    fig.savefig(threshold_curve_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    saved_paths.append(threshold_curve_path)
+
+    metric_specs = [
+        ("precision", "Precision theo Threshold", "#F58518", "precision_by_threshold.png"),
+        ("recall", "Recall theo Threshold", "#54A24B", "recall_by_threshold.png"),
+        ("f2", "F2 theo Threshold", "#4C78A8", "f2_by_threshold.png"),
+    ]
+    for metric_key, title, color, file_name in metric_specs:
+        fig, ax = plt.subplots(figsize=(8.5, 5.5))
+        ax.plot(threshold_df["threshold"], threshold_df[metric_key], color=color, linewidth=2.2)
+        ax.axvline(payload["threshold"], linestyle="--", color="#333333", linewidth=1.2, label=f"Chosen threshold={payload['threshold']:.2f}")
+        ax.set_title(f"{title} - {payload['model']}", fontsize=13, fontweight="bold")
+        ax.set_xlabel("Threshold")
+        ax.set_ylabel(metric_key.capitalize())
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, linestyle="--", alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        metric_path = output_dir / file_name
+        fig.savefig(metric_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        saved_paths.append(metric_path)
+
+    return saved_paths
+
+
+def save_score_distribution_plot(payload: dict[str, Any], output_dir: Path) -> Path:
+    plt = require_matplotlib()
+
+    y_true = pd.Series(payload["y_true"]).reset_index(drop=True)
+    scores = pd.Series(payload["scores"]).reset_index(drop=True)
+    negative_scores = scores[y_true == 0]
+    positive_scores = scores[y_true == 1]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.hist(negative_scores, bins=20, alpha=0.6, color="#4C78A8", label="Class 0", density=True)
+    ax.hist(positive_scores, bins=20, alpha=0.6, color="#E45756", label="Class 1", density=True)
+    ax.axvline(payload["threshold"], linestyle="--", color="#222222", linewidth=1.2, label=f"Chosen threshold={payload['threshold']:.2f}")
+    ax.set_title(f"Score Distribution - {payload['model']}", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Predicted Probability of Positive Class")
+    ax.set_ylabel("Density")
+    ax.set_xlim(0, 1)
+    ax.grid(True, linestyle="--", alpha=0.2)
+    ax.legend()
+    fig.tight_layout()
+
+    output_path = output_dir / "score_distribution.png"
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def save_model_level_plots(payload: dict[str, Any], plots_dir: Path) -> list[Path]:
+    model_dir = plots_dir / slugify_model_name(payload["model"])
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths = [save_confusion_matrix_plot(payload, model_dir)]
+    saved_paths.extend(save_threshold_curves(payload, model_dir))
+    saved_paths.append(save_score_distribution_plot(payload, model_dir))
+    return saved_paths
+
+
+def save_comparison_plots(comparison_df: pd.DataFrame, model_payloads: list[dict[str, Any]], output_dir: Path) -> list[Path]:
+    plots_dir = make_plots_dir(output_dir)
+    saved_paths: list[Path] = []
+
+    saved_paths.append(save_metric_bar_comparison(comparison_df, plots_dir))
+
+    roc_path = save_roc_curve_comparison(model_payloads, plots_dir)
+    if roc_path is not None:
+        saved_paths.append(roc_path)
+
+    pr_path = save_precision_recall_curve_comparison(model_payloads, plots_dir)
+    if pr_path is not None:
+        saved_paths.append(pr_path)
+
+    calibration_path = save_calibration_curve_comparison(model_payloads, plots_dir)
+    if calibration_path is not None:
+        saved_paths.append(calibration_path)
+
+    for payload in model_payloads:
+        saved_paths.extend(save_model_level_plots(payload, plots_dir))
+
+    return saved_paths
+
+
 def evaluate_saved_models(
     preprocessed_dir: str | Path | None = None,
     models_dir: str | Path | None = None,
@@ -584,6 +933,7 @@ def evaluate_saved_models(
         final_output_dir.mkdir(parents=True, exist_ok=True)
 
     results: list[dict[str, Any]] = []
+    model_payloads: list[dict[str, Any]] = []
 
     for model_key in requested_models:
         try:
@@ -627,6 +977,16 @@ def evaluate_saved_models(
                 **metrics,
             }
             results.append(result)
+            model_payloads.append(
+                {
+                    "model_key": model_key,
+                    "model": MODEL_DISPLAY_NAMES[model_key],
+                    "threshold": threshold,
+                    "scores": np.asarray(scores, dtype=float),
+                    "y_true": y_test.reset_index(drop=True),
+                    "metrics": metrics,
+                }
+            )
         except Exception as exc:
             print(f"\n[ERROR] {MODEL_DISPLAY_NAMES[model_key]} failed: {exc}")
 
@@ -658,6 +1018,7 @@ def evaluate_saved_models(
     eval_path = final_output_dir / DEFAULT_OUTPUT_FILE
     comparison_df.to_excel(eval_path, index=False)
     comparison_df.to_csv(eval_path.with_suffix(".csv"), index=False)
+    saved_plot_paths = save_comparison_plots(comparison_df, model_payloads, final_output_dir)
 
     audit_result = audit_split(bundle) if run_audit else None
     if audit_result is not None:
@@ -672,6 +1033,10 @@ def evaluate_saved_models(
     print(comparison_df.to_string(index=False))
     print(f"\nSaved evaluation table to: {eval_path}")
     print(f"Saved evaluation table to: {eval_path.with_suffix('.csv')}")
+    if saved_plot_paths:
+        print("Saved plots:")
+        for plot_path in saved_plot_paths:
+            print(f"  - {plot_path}")
 
     return comparison_df, audit_result
 

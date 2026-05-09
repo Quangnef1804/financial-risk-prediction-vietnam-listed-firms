@@ -15,9 +15,13 @@ from env_config import get_path, load_env
 load_env()
 
 
-HNX_PATH = str(get_path("RAW_HNX_FILE", Path("Data") / "raw" / "HNX_V2.xlsx"))
-HOSE_PATH = str(get_path("RAW_HOSE_FILE", Path("Data") / "raw" / "HOSE_V2.xlsx"))
-OUTPUT_DIR = Path(get_path("RAW_OVERVIEW_OUTPUT_DIR", Path("Data") / "raw" / "overview"))
+RAW_HNX_ENV = "RAW_HNX_FILE"
+RAW_HOSE_ENV = "RAW_HOSE_FILE"
+RAW_OVERVIEW_OUTPUT_ENV = "RAW_OVERVIEW_OUTPUT_DIR"
+
+HNX_PATH = str(get_path(RAW_HNX_ENV, Path("Data") / "raw" / "HNX_V2.xlsx"))
+HOSE_PATH = str(get_path(RAW_HOSE_ENV, Path("Data") / "raw" / "HOSE_V2.xlsx"))
+OUTPUT_DIR = get_path(RAW_OVERVIEW_OUTPUT_ENV, Path("Data") / "raw" / "overview")
 VND_TO_BILLION = 1_000_000_000
 
 MAIN_VARIABLES = [
