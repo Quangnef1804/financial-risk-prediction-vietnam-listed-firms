@@ -94,7 +94,7 @@ def main():
     for j in range(len(FEATURES), len(axes)):
         axes[j].axis("off")
 
-    plt.suptitle("So sanh boxplot theo target", fontsize=14, y=0.98)
+    plt.suptitle("Boxplot Comparison by Target", fontsize=14, y=0.98)
     plt.tight_layout()
     boxplot_path = output_dir / "boxplot_by_target.png"
     plt.savefig(boxplot_path, bbox_inches="tight", dpi=200)
@@ -118,7 +118,7 @@ def main():
     for j in range(len(FEATURES), len(axes)):
         axes[j].axis("off")
 
-    plt.suptitle("So sanh violin plot theo target", fontsize=14, y=0.98)
+    plt.suptitle("Violin Plot Comparison by Target", fontsize=14, y=0.98)
     plt.tight_layout()
     violin_path = output_dir / "violin_by_target.png"
     plt.savefig(violin_path, bbox_inches="tight", dpi=200)
@@ -159,7 +159,7 @@ def main():
     plt.figure(figsize=(10, 5))
     bars = plt.bar(effect_df["feature"], effect_df["rank_biserial_corr"])
     plt.axhline(0, linewidth=1)
-    plt.title("Effect size theo Rank-Biserial Correlation")
+    plt.title("Effect Size by Rank-Biserial Correlation")
     plt.ylabel("Rank-biserial correlation")
     plt.xlabel("Feature")
     plt.grid(axis="y", alpha=0.25)

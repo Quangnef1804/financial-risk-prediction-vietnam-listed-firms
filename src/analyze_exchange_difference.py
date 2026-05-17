@@ -66,7 +66,7 @@ def plot_boxplots_by_exchange(df: pd.DataFrame, output_path: Path):
             patch.set_facecolor(color)
             patch.set_alpha(0.6)
 
-        ax.set_title(f"Boxplot theo san: {feature}")
+        ax.set_title(f"Boxplot by exchange: {feature}")
         ax.set_ylabel(feature)
         ax.grid(alpha=0.25)
         if feature == "ROS":
@@ -75,7 +75,7 @@ def plot_boxplots_by_exchange(df: pd.DataFrame, output_path: Path):
     for j in range(len(FEATURES), len(axes)):
         axes[j].axis("off")
 
-    plt.suptitle("So sanh phan phoi features giua HNX va HOSE", fontsize=14, y=0.98)
+    plt.suptitle("Feature Distribution Comparison between HNX and HOSE", fontsize=14, y=0.98)
     plt.tight_layout()
     plt.savefig(output_path, dpi=220, bbox_inches="tight")
     plt.close()
@@ -119,9 +119,9 @@ def plot_stacked_target_bar(df: pd.DataFrame, output_path: Path):
     target_ratio = target_counts.div(target_counts.sum(axis=1), axis=0)
 
     ax = target_ratio.plot(kind="bar", stacked=True, figsize=(8, 5))
-    ax.set_title("Ty le target = 0 / 1 theo san")
-    ax.set_xlabel("San")
-    ax.set_ylabel("Ty le")
+    ax.set_title("Target = 0 / 1 Ratio by Exchange")
+    ax.set_xlabel("Exchange")
+    ax.set_ylabel("Ratio")
     ax.legend(title="target")
     ax.grid(axis="y", alpha=0.25)
 

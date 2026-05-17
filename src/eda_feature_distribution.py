@@ -109,7 +109,7 @@ def plot_histograms(data: pd.DataFrame, output_path: Path) -> None:
             ax.plot(x_grid, kde(x_grid), linewidth=2, label="KDE")
 
         if col == "ROS":
-            ax.axvline(0, linestyle="--", linewidth=1.5, label="0 (lai/lo)")
+            ax.axvline(0, linestyle="--", linewidth=1.5, label="0 (profit/loss)")
         if col == "CR" and len(s) > 0:
             ax.axvline(s.max(), linestyle=":", linewidth=1.5, label=f"max={s.max():.2f}")
 
@@ -122,7 +122,7 @@ def plot_histograms(data: pd.DataFrame, output_path: Path) -> None:
     for j in range(len(FEATURES), len(axes)):
         axes[j].axis("off")
 
-    plt.suptitle("Phan phoi 5 features tai chinh", fontsize=14, y=0.98)
+    plt.suptitle("Distribution of 5 Financial Features", fontsize=14, y=0.98)
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -134,8 +134,8 @@ def plot_boxplot(data: pd.DataFrame, output_path: Path) -> None:
     ax.boxplot(box_data, tick_labels=FEATURES, showfliers=True)
     ax.set_yscale("symlog", linthresh=1)
     ax.axhline(0, linestyle="--", alpha=0.6)
-    ax.set_title("Boxplot cua 5 features (truc y = symlog)")
-    ax.set_ylabel("Gia tri")
+    ax.set_title("Boxplot of 5 Features (Y-axis = symlog)")
+    ax.set_ylabel("Value")
     ax.grid(axis="y", alpha=0.25)
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches="tight")

@@ -26,6 +26,8 @@ DEFAULT_PREPROCESSED_ENV_VAR = "PREPROCESSING_OUTPUT_DIR"
 DEFAULT_MODELS_ENV_VAR = "MODELS_OUTPUT_DIR"
 
 GRID_SEARCH_BETA = 2.0
+ALTMAN_DISTRESS_CUTOFF = 1.81
+ALTMAN_MODEL_KEY = "altman_z_score"
 
 MODEL_DISPLAY_NAMES = {
     "logistic_regression": "Logistic Regression",
@@ -62,8 +64,9 @@ COMPARISON_METRICS = [
     ("specificity", "Specificity"),
     ("accuracy", "Accuracy"),
 ]
-PLOT_COLORS = ["#4C78A8", "#F58518", "#54A24B"]
+PLOT_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#E45756"]
 THRESHOLD_CURVE_GRID = np.round(np.arange(0.0, 1.001, 0.01), 2)
+ALTMAN_REQUIRED_FEATURES = ["CR", "ROS", "DS", "TAT"]
 
 
 def ensure_utf8_output() -> None:
@@ -283,6 +286,123 @@ def evaluate_predictions(
         "tp": int(tp),
     }
     return metrics, y_pred
+
+
+def restore_altman_input_features(X_raw: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    missing = [col for col in ALTMAN_REQUIRED_FEATURES if col not in X_raw.columns]
+    if missing:
+        raise ValueError(f"Khong the tinh Altman Z-score vi thieu feature: {missing}")
+
+    restored = X_raw[ALTMAN_REQUIRED_FEATURES].copy()
+    for col in ALTMAN_REQUIRED_FEATURES:
+        restored[col] = pd.to_numeric(restored[col], errors="coerce")
+
+    log_plan = config.get("log_plan", {})
+    for col in ["CR", "TAT"]:
+        if col in restored.columns and bool(log_plan.get(col, {}).get("apply", False)):
+            restored[col] = np.expm1(restored[col])
+
+    if restored.isna().any().any():
+        bad_cols = restored.columns[restored.isna().any()].tolist()
+        raise ValueError(f"Altman input co gia tri khong hop le o cac cot: {bad_cols}")
+
+    return restored
+
+
+def compute_altman_z_score_proxy(X_raw: pd.DataFrame, config: dict[str, Any]) -> tuple[pd.Series, pd.DataFrame]:
+    features = restore_altman_input_features(X_raw, config)
+
+    # Available engineered features:
+    # CR = current_assets / current_liabilities
+    # ROS = pre_tax_profit / revenue
+    # DS = total_liabilities / revenue
+    # TAT = revenue / total_assets
+    #
+    # Original Altman Z requires WC/TA, RE/TA, EBIT/TA, MVE/TL, Sales/TA.
+    # RE/TA and market equity are unavailable, so this is an interpretable proxy.
+    total_liabilities_to_assets = (features["DS"] * features["TAT"]).replace([np.inf, -np.inf], np.nan)
+    total_liabilities_to_assets = total_liabilities_to_assets.clip(lower=1e-6)
+    working_capital_to_assets = (features["CR"] - 1.0) * total_liabilities_to_assets
+    ebit_to_assets = features["ROS"] * features["TAT"]
+    book_equity_to_liabilities = ((1.0 - total_liabilities_to_assets) / total_liabilities_to_assets).clip(-10, 10)
+    sales_to_assets = features["TAT"]
+
+    z_score = (
+        1.2 * working_capital_to_assets
+        + 3.3 * ebit_to_assets
+        + 0.6 * book_equity_to_liabilities
+        + 1.0 * sales_to_assets
+    )
+    z_score = z_score.replace([np.inf, -np.inf], np.nan)
+
+    if z_score.isna().any():
+        raise ValueError("Altman Z-score tinh ra NaN/inf. Kiem tra CR, ROS, DS, TAT.")
+
+    components = pd.DataFrame(
+        {
+            "CR": features["CR"].reset_index(drop=True),
+            "ROS": features["ROS"].reset_index(drop=True),
+            "DS": features["DS"].reset_index(drop=True),
+            "TAT": features["TAT"].reset_index(drop=True),
+            "working_capital_to_assets_proxy": working_capital_to_assets.reset_index(drop=True),
+            "ebit_to_assets_proxy": ebit_to_assets.reset_index(drop=True),
+            "book_equity_to_liabilities_proxy": book_equity_to_liabilities.reset_index(drop=True),
+            "sales_to_assets": sales_to_assets.reset_index(drop=True),
+            "altman_z_score_proxy": z_score.reset_index(drop=True),
+        }
+    )
+    return z_score.reset_index(drop=True), components
+
+
+def evaluate_altman_z_score_baseline(bundle: dict[str, Any], output_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    z_score, components = compute_altman_z_score_proxy(bundle["X_test_raw"], bundle.get("config", {}))
+
+    # Lower Altman Z means higher distress risk. Convert to a positive-class score
+    # where 0.50 corresponds to the classic distress cutoff Z <= 1.81.
+    z_delta = np.clip(z_score.to_numpy(dtype=float) - ALTMAN_DISTRESS_CUTOFF, -50, 50)
+    scores = 1.0 / (1.0 + np.exp(z_delta))
+    threshold = 0.50
+    y_test = bundle["y_test"]
+
+    metrics, y_pred = evaluate_predictions(y_test, scores, threshold=threshold)
+    prediction_path = save_prediction_table(
+        model_key=ALTMAN_MODEL_KEY,
+        meta_test=bundle["meta_test"],
+        y_test=y_test,
+        y_pred=y_pred,
+        scores=scores,
+        threshold=threshold,
+        output_dir=output_dir,
+    )
+
+    component_df = components.copy()
+    if bundle["meta_test"] is not None:
+        component_df = pd.concat([bundle["meta_test"].reset_index(drop=True), component_df], axis=1)
+    component_path = output_dir / "altman_z_score_components.csv"
+    component_df.to_csv(component_path, index=False)
+
+    print_metrics("Altman Z-score Proxy", "rule_based_raw_proxy", threshold, metrics)
+    print(f"Altman distress cutoff: Z <= {ALTMAN_DISTRESS_CUTOFF:.2f}")
+    print(f"Saved Altman components: {component_path}")
+
+    result = {
+        "model": "Altman Z-score Proxy",
+        "input_data": "rule_based_raw_proxy",
+        "threshold": threshold,
+        "artifact_loader": "formula",
+        "model_path": "",
+        "prediction_path": str(prediction_path),
+        **metrics,
+    }
+    payload = {
+        "model_key": ALTMAN_MODEL_KEY,
+        "model": "Altman Z-score Proxy",
+        "threshold": threshold,
+        "scores": np.asarray(scores, dtype=float),
+        "y_true": y_test.reset_index(drop=True),
+        "metrics": metrics,
+    }
+    return result, payload
 
 
 def print_metrics(model_name: str, dataset_kind: str, threshold: float, metrics: dict[str, float]) -> None:
@@ -934,6 +1054,13 @@ def evaluate_saved_models(
 
     results: list[dict[str, Any]] = []
     model_payloads: list[dict[str, Any]] = []
+
+    try:
+        altman_result, altman_payload = evaluate_altman_z_score_baseline(bundle, final_output_dir)
+        results.append(altman_result)
+        model_payloads.append(altman_payload)
+    except Exception as exc:
+        print(f"\n[ERROR] Altman Z-score Proxy failed: {exc}")
 
     for model_key in requested_models:
         try:

@@ -93,7 +93,7 @@ def draw_pairplot(df: pd.DataFrame, features: list[str], target_col: str, out_pa
         Line2D([0], [0], marker='o', linestyle='', label='target=1', markersize=7, color='tab:orange')
     ]
     fig.legend(handles=handles, loc="upper center", ncol=2, frameon=True)
-    fig.suptitle("Pairplot cho 5 features, to mau theo target", fontsize=16, y=0.995)
+    fig.suptitle("Pairplot of 5 Features Colored by Target", fontsize=16, y=0.995)
     plt.tight_layout(rect=[0, 0, 1, 0.98])
     plt.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close()
@@ -223,7 +223,7 @@ def main():
     im2 = plot_heatmap(axes[1], spearman_corr, "Spearman Correlation")
     cbar = fig.colorbar(im2, ax=axes.ravel().tolist(), shrink=0.88)
     cbar.set_label("Correlation coefficient")
-    plt.suptitle("Heatmap tuong quan giua 5 features", fontsize=15, y=0.98)
+    plt.suptitle("Correlation Heatmaps among 5 Features", fontsize=15, y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     heatmap_path = output_dir / "correlation_heatmaps.png"
